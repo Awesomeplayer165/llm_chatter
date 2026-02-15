@@ -1,0 +1,18 @@
+{
+  "default": "ollama-local",
+  "providers": [
+    {
+      "id": "ollama-local",
+      "name": "Ollama (local)",
+      "type": "ollama",
+      "base_url": "http://localhost:11434"
+    },
+    {
+      "id": "lmstudio",
+      "name": "LMStudio",
+      "type": "openai",
+      "base_url": "http://localhost:1234/v1",
+      "api_key": ""
+    }
+  ]
+}

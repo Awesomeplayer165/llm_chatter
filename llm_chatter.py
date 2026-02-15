@@ -1,5 +1,6 @@
 import sys
 import json
+import os
 import requests
 import threading
 import time
@@ -13,31 +14,60 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer, Qt
 from PyQt5.QtGui import QFont, QTextCursor, QColor, QPalette, QTextCharFormat
 
-class OllamaAPI:
-    def __init__(self, base_url="http://localhost:11434"):
-        self.base_url = base_url
-    
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def load_config():
+    """Load config.json; return dict with default and providers list."""
+    default_config = {
+        "default": "ollama-local",
+        "providers": [
+            {"id": "ollama-local", "name": "Ollama (local)", "type": "ollama", "base_url": "http://localhost:11434"},
+        ],
+    }
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default_config
+
+def get_provider_config(config, provider_id):
+    """Return the provider dict with given id, or None."""
+    for p in config.get("providers", []):
+        if p.get("id") == provider_id:
+            return p
+    return None
+
+# ---------------------------------------------------------------------------
+# LLM provider interface: get_models() -> list[str], chat_stream(...) -> yield str
+# ---------------------------------------------------------------------------
+
+class OllamaProvider:
+    """Ollama API: /api/tags for models, /api/chat for streaming."""
+    def __init__(self, base_url="http://localhost:11434", **kwargs):
+        self.base_url = base_url.rstrip("/")
+
     def get_models(self):
-        """Get list of available models from Ollama"""
         try:
-            response = requests.get(f"{self.base_url}/api/tags")
+            response = requests.get(f"{self.base_url}/api/tags", timeout=10)
             if response.status_code == 200:
-                models = response.json().get('models', [])
-                return [model['name'] for model in models]
+                models = response.json().get("models", [])
+                return [m.get("name", "") for m in models if m.get("name")]
             return []
         except Exception as e:
-            print(f"Error fetching models: {e}")
+            print(f"Error fetching Ollama models: {e}")
             return []
-    
+
     def chat_stream(self, model, messages, system_prompt="", temperature=0.7):
-        """Send streaming chat request to Ollama"""
         try:
-            # Prepare messages with system prompt
             chat_messages = []
             if system_prompt:
                 chat_messages.append({"role": "system", "content": system_prompt})
             chat_messages.extend(messages)
-            
             payload = {
                 "model": model,
                 "messages": chat_messages,
@@ -45,26 +75,114 @@ class OllamaAPI:
                 "options": {
                     "temperature": temperature,
                     "top_p": 0.9,
-                    "repeat_penalty": 1.1  # Penalize repetition
-                }
+                    "repeat_penalty": 1.1,
+                },
             }
-            
-            response = requests.post(f"{self.base_url}/api/chat", json=payload, stream=True)
-            if response.status_code == 200:
-                for line in response.iter_lines():
-                    if line:
-                        try:
-                            chunk = json.loads(line.decode('utf-8'))
-                            if 'message' in chunk and 'content' in chunk['message']:
-                                yield chunk['message']['content']
-                            if chunk.get('done', False):
-                                break
-                        except json.JSONDecodeError:
-                            continue
-            else:
+            response = requests.post(
+                f"{self.base_url}/api/chat", json=payload, stream=True, timeout=60
+            )
+            if response.status_code != 200:
                 yield f"Error: {response.status_code}"
+                return
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        chunk = json.loads(line.decode("utf-8"))
+                        if "message" in chunk and "content" in chunk["message"]:
+                            yield chunk["message"]["content"]
+                        if chunk.get("done", False):
+                            break
+                    except json.JSONDecodeError:
+                        continue
         except Exception as e:
             yield f"Error: {str(e)}"
+
+
+class OpenAIProvider:
+    """OpenAI-compatible API: /v1/models for list, /v1/chat/completions for streaming."""
+    def __init__(self, base_url, api_key="", **kwargs):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+
+    def _headers(self):
+        h = {"Content-Type": "application/json"}
+        if self.api_key:
+            h["Authorization"] = f"Bearer {self.api_key}"
+        return h
+
+    def get_models(self):
+        try:
+            response = requests.get(
+                f"{self.base_url}/models",
+                headers=self._headers(),
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return []
+            data = response.json()
+            # OpenAI: { "data": [ {"id": "gpt-4", ...}, ... ] }
+            models = data.get("data", [])
+            return [m.get("id", "") for m in models if m.get("id")]
+        except Exception as e:
+            print(f"Error fetching OpenAI models: {e}")
+            return []
+
+    def chat_stream(self, model, messages, system_prompt="", temperature=0.7):
+        try:
+            chat_messages = []
+            if system_prompt:
+                chat_messages.append({"role": "system", "content": system_prompt})
+            chat_messages.extend(messages)
+            payload = {
+                "model": model,
+                "messages": chat_messages,
+                "stream": True,
+                "temperature": temperature,
+            }
+            url = f"{self.base_url}/chat/completions"
+            response = requests.post(
+                url, json=payload, headers=self._headers(), stream=True, timeout=120
+            )
+            if response.status_code != 200:
+                yield f"Error: {response.status_code}"
+                return
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                line = line.decode("utf-8").strip()
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    choices = chunk.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content")
+                        if content:
+                            yield content
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            yield f"Error: {str(e)}"
+
+
+def create_provider(provider_config):
+    """Create a provider instance from a config dict (id, name, type, base_url, api_key?)."""
+    if not provider_config:
+        return None
+    ptype = (provider_config.get("type") or "ollama").lower()
+    base_url = provider_config.get("base_url", "").strip() or "http://localhost:11434"
+    if ptype == "ollama":
+        return OllamaProvider(base_url=base_url)
+    if ptype == "openai":
+        return OpenAIProvider(
+            base_url=base_url,
+            api_key=(provider_config.get("api_key") or "").strip(),
+        )
+    return OllamaProvider(base_url=base_url)
 
 class ThinkSection:
     def __init__(self):
@@ -94,10 +212,10 @@ class StreamingChatWorker(QThread):
     think_section_start = pyqtSignal(str)  # sender
     think_section_chunk = pyqtSignal(str, str)  # sender, chunk
     think_section_complete = pyqtSignal(str, float)  # sender, duration
-    
-    def __init__(self, ollama_api):
+
+    def __init__(self, llm_provider):
         super().__init__()
-        self.ollama_api = ollama_api
+        self.llm_provider = llm_provider
         self.running = False
         self.left_model = ""
         self.right_model = ""
@@ -155,7 +273,7 @@ class StreamingChatWorker(QThread):
         # Trim history before each request to prevent loops
         self.trim_history()
         
-        for chunk in self.ollama_api.chat_stream(model, self.conversation_history, system_prompt, self.temperature):
+        for chunk in self.llm_provider.chat_stream(model, self.conversation_history, system_prompt, self.temperature):
             if not self.running:
                 break
                 
@@ -551,29 +669,58 @@ class ChatWindow(QMainWindow):
 class DualLLMChat(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.ollama_api = OllamaAPI()
-        self.chat_worker = StreamingChatWorker(self.ollama_api)
+        self.config = load_config()
+        default_id = self.config.get("default") or (
+            (self.config.get("providers") or [{}])[0].get("id")
+        )
+        provider_config = get_provider_config(self.config, default_id)
+        self._current_provider_id = default_id
+        self.llm_provider = create_provider(provider_config) if provider_config else OllamaProvider()
+        self.chat_worker = StreamingChatWorker(self.llm_provider)
         self.chat_window = None
         self.setup_ui()
         self.setup_connections()
         self.load_models()
-        
+
+    def _on_provider_changed(self):
+        pid = self.provider_combo.currentData()
+        if not pid:
+            return
+        self._current_provider_id = pid
+        provider_config = get_provider_config(self.config, pid)
+        self.llm_provider = create_provider(provider_config) if provider_config else OllamaProvider()
+        self.chat_worker.llm_provider = self.llm_provider
+        self.load_models()
+
     def setup_ui(self):
-        self.setWindowTitle("Dual LLM Chat Controller - Ollama")
+        self.setWindowTitle("Dual LLM Chat Controller")
         self.setGeometry(100, 100, 800, 700)
-        
+
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        
+
         main_layout = QVBoxLayout(central_widget)
-        
+
         # Control panel
         control_group = QGroupBox("Configuration")
         control_layout = QVBoxLayout(control_group)
-        
+
+        # Provider selection
+        provider_layout = QVBoxLayout()
+        provider_layout.addWidget(QLabel("Provider (from config.json):"))
+        self.provider_combo = QComboBox()
+        for p in self.config.get("providers", []):
+            name = p.get("name") or p.get("id") or "Unnamed"
+            self.provider_combo.addItem(name, p.get("id"))
+        idx = self.provider_combo.findData(self._current_provider_id)
+        if idx >= 0:
+            self.provider_combo.setCurrentIndex(idx)
+        provider_layout.addWidget(self.provider_combo)
+        control_layout.addLayout(provider_layout)
+
         # Model selection row
         model_layout = QHBoxLayout()
-        
+
         # Left model selection
         left_model_layout = QVBoxLayout()
         left_model_layout.addWidget(QLabel("Left Model:"))
@@ -681,6 +828,7 @@ class DualLLMChat(QMainWindow):
         main_layout.addWidget(self.status_label)
     
     def setup_connections(self):
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         self.refresh_button.clicked.connect(self.load_models)
         self.open_chat_button.clicked.connect(self.open_chat_window)
         self.start_button.clicked.connect(self.start_conversation)
@@ -701,17 +849,17 @@ class DualLLMChat(QMainWindow):
     
     def load_models(self):
         self.status_label.setText("Loading models...")
-        models = self.ollama_api.get_models()
-        
+        models = self.llm_provider.get_models() if self.llm_provider else []
+
         self.left_model_combo.clear()
         self.right_model_combo.clear()
-        
+
         if models:
             self.left_model_combo.addItems(models)
             self.right_model_combo.addItems(models)
             self.status_label.setText(f"Loaded {len(models)} models")
         else:
-            self.status_label.setText("No models found. Make sure Ollama is running.")
+            self.status_label.setText("No models found. Check provider and endpoint in config.json.")
     
     def open_chat_window(self):
         if self.chat_window is None:
